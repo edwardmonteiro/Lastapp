@@ -35,7 +35,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             store.getPref("think", D_THINK),
             store.getPref("fast", D_FAST),
             store.getPref("vision", D_VISION),
-            store.getPref("embed", D_EMBED),
+            store.getPref("embed", D_EMBED).let { if (it == "nvidia/llama-3.2-nv-embedqa-1b-v2") D_EMBED else it },
         )
     )
         private set
@@ -140,11 +140,11 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     val prepared = withContext(Dispatchers.IO) { prepareImage(photo, id) }
                     imageName = prepared.first
                     val desc = withContext(Dispatchers.IO) {
-                        api.chat(cfg.vision, visionMessages(raw, prepared.second), 2000, 0.2)
+                        api.chat(cfg.vision, visionMessages(raw, prepared.second), 4096, 0.2, noThink = true)
                     }
                     text = if (raw.isBlank()) desc else raw + "\n\n" + desc
                 } catch (e: Exception) {
-                    message = "Visão falhou: ${e.message}"
+                    warn("Visão falhou: ${e.message}")
                     if (text.isBlank()) text = "(foto sem descrição)"
                 }
             }
@@ -153,7 +153,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             var tags: List<String> = emptyList()
             try {
                 busy = "Titulando · " + short(cfg.fast)
-                val out = withContext(Dispatchers.IO) { api.chat(cfg.fast, tagMessages(text), 1200, 0.2) }
+                val out = withContext(Dispatchers.IO) { api.chat(cfg.fast, tagMessages(text), 2048, 0.2, noThink = true) }
                 val j = parseJson(out)
                 if (j != null) {
                     title = j.optString("titulo", title).ifBlank { title }.take(70)
@@ -161,15 +161,15 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     if (arr != null) tags = (0 until arr.length()).map { arr.get(it).toString().lowercase().trim() }.filter { it.isNotEmpty() }.take(5)
                 }
             } catch (e: Exception) {
-                message = "Titulação falhou: ${e.message}"
+                warn("Titulação falhou: ${e.message}")
             }
 
             var emb: FloatArray? = null
             try {
                 busy = "Indexando · " + short(cfg.embed)
-                emb = withContext(Dispatchers.IO) { api.embed(cfg.embed, listOf(embedText(title, text)), false)[0] }
+                emb = embedSafe(listOf(embedText(title, text)), false)[0]
             } catch (e: Exception) {
-                message = "Indexação falhou (tento de novo depois): ${e.message}"
+                warn("Indexação falhou (tento de novo depois): ${e.message}")
             }
 
             notes.add(0, Note(id, System.currentTimeMillis(), kind, text, title, tags, imageName, emb))
@@ -191,7 +191,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             try {
                 busy = "Buscando por significado"
                 ensureEmbeddings()
-                val qv = withContext(Dispatchers.IO) { api.embed(cfg.embed, listOf(query), true)[0] }
+                val qv = embedSafe(listOf(query), true)[0]
                 results = rank(qv, 8).map { it.first }
             } catch (e: Exception) {
                 message = "Busca falhou: ${e.message}"
@@ -216,14 +216,14 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             try {
                 busy = "Recuperando notas · " + short(cfg.embed)
                 ensureEmbeddings()
-                val qv = withContext(Dispatchers.IO) { api.embed(cfg.embed, listOf(query), true)[0] }
+                val qv = embedSafe(listOf(query), true)[0]
                 val top = rank(qv, 6).map { it.first }
                 if (top.isEmpty()) {
                     message = "Nenhuma nota indexada ainda."
                     return@launch
                 }
                 busy = "Raciocinando · " + short(cfg.think)
-                val out = withContext(Dispatchers.IO) { api.chat(cfg.think, askMessages(query, top), 3000, 0.3) }
+                val out = withContext(Dispatchers.IO) { api.chat(cfg.think, askMessages(query, top), 6000, 0.3) }
                 answer = Answer(query, out, top)
             } catch (e: Exception) {
                 message = "Pergunta falhou: ${e.message}"
@@ -252,7 +252,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 }
                 val list = picked.values.take(10).toList()
                 busy = "Conectando ideias · " + short(cfg.think)
-                val out = withContext(Dispatchers.IO) { api.chat(cfg.think, connectMessages(list), 3500, 0.5) }
+                val out = withContext(Dispatchers.IO) { api.chat(cfg.think, connectMessages(list), 6000, 0.5) }
                 answer = Answer("Conexões entre suas notas recentes", out, list)
             } catch (e: Exception) {
                 message = "Conexão falhou: ${e.message}"
@@ -277,12 +277,45 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(Dispatchers.IO) { store.save(snap) }
     }
 
+    private var embedSwitched = false
+
+    private fun warn(s: String) {
+        val cur = message
+        message = if (cur == null) s else (cur + "\n" + s).lines().takeLast(3).joinToString("\n")
+    }
+
+    /** Embeddings com auto-recuperação: se o modelo foi aposentado (410/404), acha outro no catálogo. */
+    private suspend fun embedSafe(texts: List<String>, query: Boolean): List<FloatArray> {
+        return withContext(Dispatchers.IO) {
+            try {
+                api.embed(cfg.embed, texts, query)
+            } catch (e: java.io.IOException) {
+                val m = e.message.orEmpty()
+                if (!(m.startsWith("HTTP 410") || m.startsWith("HTTP 404"))) throw e
+                val ids = api.models()
+                val next = ids.filter { Regex("embed", RegexOption.IGNORE_CASE).containsMatchIn(it) }
+                    .filterNot { Regex("-vl|rerank|clip", RegexOption.IGNORE_CASE).containsMatchIn(it) }
+                    .sortedWith(compareByDescending<String> { it.startsWith("nvidia/llama-nemotron-embed") }.thenByDescending { it })
+                    .firstOrNull { it != cfg.embed } ?: throw e
+                withContext(Dispatchers.Main) {
+                    applyCfg(cfg.copy(embed = next))
+                    embedSwitched = true
+                    warn("Modelo de embeddings trocado para ${short(next)}")
+                }
+                api.embed(next, texts, query)
+            }
+        }
+    }
+
     private suspend fun ensureEmbeddings() {
         val missing = notes.filter { it.embedding == null }
         if (missing.isEmpty()) return
         for (chunk in missing.chunked(16)) {
-            val vecs = withContext(Dispatchers.IO) {
-                api.embed(cfg.embed, chunk.map { embedText(it.title, it.text) }, false)
+            val vecs = embedSafe(chunk.map { embedText(it.title, it.text) }, false)
+            if (embedSwitched) {
+                embedSwitched = false
+                ensureEmbeddings()
+                return
             }
             chunk.forEachIndexed { i, n ->
                 val idx = notes.indexOfFirst { it.id == n.id }

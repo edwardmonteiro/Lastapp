@@ -13,7 +13,7 @@ import kotlin.math.sqrt
 const val D_THINK = "nvidia/nemotron-3-super-120b-a12b"
 const val D_FAST = "nvidia/nemotron-3-nano-30b-a3b"
 const val D_VISION = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
-const val D_EMBED = "nvidia/llama-3.2-nv-embedqa-1b-v2"
+const val D_EMBED = "nvidia/llama-nemotron-embed-1b-v2"
 
 /** Cliente da API OpenAI-compatível do build.nvidia.com. */
 class Nvidia(private val key: () -> String) {
@@ -46,14 +46,27 @@ class Nvidia(private val key: () -> String) {
         return (0 until data.length()).map { data.getJSONObject(it).getString("id") }
     }
 
-    fun chat(model: String, messages: JSONArray, maxTokens: Int, temp: Double): String {
-        val body = JSONObject()
-            .put("model", model)
-            .put("messages", messages)
-            .put("max_tokens", maxTokens)
-            .put("temperature", temp)
-            .put("stream", false)
-        val res = call("/chat/completions", body)
+    fun chat(model: String, messages: JSONArray, maxTokens: Int, temp: Double, noThink: Boolean = false): String {
+        fun body(withKwargs: Boolean): JSONObject {
+            val b = JSONObject()
+                .put("model", model)
+                .put("messages", messages)
+                .put("max_tokens", maxTokens)
+                .put("temperature", temp)
+                .put("stream", false)
+            if (withKwargs) b.put("chat_template_kwargs", JSONObject().put("enable_thinking", false))
+            return b
+        }
+        val res = if (noThink) {
+            try {
+                call("/chat/completions", body(true))
+            } catch (e: IOException) {
+                // alguns modelos não aceitam o parâmetro; tenta de novo sem ele
+                if (e.message?.startsWith("HTTP 400") == true || e.message?.startsWith("HTTP 422") == true) {
+                    call("/chat/completions", body(false))
+                } else throw e
+            }
+        } else call("/chat/completions", body(false))
         val msg = res.getJSONArray("choices").getJSONObject(0).getJSONObject("message")
         var content = if (msg.isNull("content")) "" else msg.getString("content")
         content = stripThink(content)
@@ -89,7 +102,8 @@ class Nvidia(private val key: () -> String) {
         return try {
             run(true)
         } catch (e: IOException) {
-            if (e.message?.contains("input_type") == true || e.message?.contains("truncate") == true) run(false) else throw e
+            val m = e.message.orEmpty()
+            if (m.startsWith("HTTP 400") || m.startsWith("HTTP 422")) run(false) else throw e
         }
     }
 
