@@ -78,6 +78,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     fun detect() {
         if (!ready()) return
+        noEmbed = false
         viewModelScope.launch {
             try {
                 busy = "Consultando o catálogo"
@@ -190,9 +191,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 busy = "Buscando por significado"
-                ensureEmbeddings()
-                val qv = embedSafe(listOf(query), true)[0]
-                results = rank(qv, 8).map { it.first }
+                results = retrieve(query, 8)
             } catch (e: Exception) {
                 message = "Busca falhou: ${e.message}"
             } finally {
@@ -214,14 +213,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch {
             try {
-                busy = "Recuperando notas · " + short(cfg.embed)
-                ensureEmbeddings()
-                val qv = embedSafe(listOf(query), true)[0]
-                val top = rank(qv, 6).map { it.first }
-                if (top.isEmpty()) {
-                    message = "Nenhuma nota indexada ainda."
-                    return@launch
-                }
+                busy = "Recuperando notas"
+                val top = retrieve(query, 6).ifEmpty { notes.take(6).toList() }
                 busy = "Raciocinando · " + short(cfg.think)
                 val out = withContext(Dispatchers.IO) { api.chat(cfg.think, askMessages(query, top), 6000, 0.3) }
                 answer = Answer(query, out, top)
@@ -241,8 +234,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         }
         viewModelScope.launch {
             try {
-                busy = "Indexando · " + short(cfg.embed)
-                ensureEmbeddings()
+                busy = "Indexando"
+                try {
+                    ensureEmbeddings()
+                } catch (e: Exception) {
+                    warn("Sem embeddings, conectando pelas notas mais recentes: ${e.message?.take(160)}")
+                }
                 val picked = LinkedHashMap<String, Note>()
                 val seeds = notes.take(3)
                 seeds.forEach { picked[it.id] = it }
@@ -250,6 +247,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     val sv = seed.embedding ?: return@forEach
                     rank(sv, 5).forEach { pair -> if (!picked.containsKey(pair.first.id)) picked[pair.first.id] = pair.first }
                 }
+                notes.take(8).forEach { if (picked.size < 8) picked.putIfAbsent(it.id, it) }
                 val list = picked.values.take(10).toList()
                 busy = "Conectando ideias · " + short(cfg.think)
                 val out = withContext(Dispatchers.IO) { api.chat(cfg.think, connectMessages(list), 6000, 0.5) }
@@ -284,27 +282,74 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         message = if (cur == null) s else (cur + "\n" + s).lines().takeLast(3).joinToString("\n")
     }
 
-    /** Embeddings com auto-recuperação: se o modelo foi aposentado (410/404), acha outro no catálogo. */
+    private var noEmbed = false
+
+    private val preferred = listOf(
+        "llama-nemotron-embed-1b-v2", "nv-embedqa-e5-v5", "nv-embed-v1", "nv-embedqa-mistral-7b-v2",
+        "bge-m3", "embed-qa-4", "arctic-embed-l",
+    )
+
+    private fun isAccessErr(m: String) =
+        m.startsWith("HTTP 404") || m.startsWith("HTTP 410") || m.startsWith("HTTP 403") || m.startsWith("HTTP 400")
+
+    /** Embeddings com auto-recuperação: testa os modelos do catálogo até achar um que a conta consiga usar. */
     private suspend fun embedSafe(texts: List<String>, query: Boolean): List<FloatArray> {
+        if (noEmbed) throw java.io.IOException("nenhum modelo de embeddings acessível nesta conta")
         return withContext(Dispatchers.IO) {
             try {
                 api.embed(cfg.embed, texts, query)
             } catch (e: java.io.IOException) {
-                val m = e.message.orEmpty()
-                if (!(m.startsWith("HTTP 410") || m.startsWith("HTTP 404"))) throw e
+                if (!isAccessErr(e.message.orEmpty())) throw e
+                val tried = mutableListOf(short(cfg.embed))
                 val ids = api.models()
-                val next = ids.filter { Regex("embed", RegexOption.IGNORE_CASE).containsMatchIn(it) }
-                    .filterNot { Regex("-vl|rerank|clip", RegexOption.IGNORE_CASE).containsMatchIn(it) }
-                    .sortedWith(compareByDescending<String> { it.startsWith("nvidia/llama-nemotron-embed") }.thenByDescending { it })
-                    .firstOrNull { it != cfg.embed } ?: throw e
-                withContext(Dispatchers.Main) {
-                    applyCfg(cfg.copy(embed = next))
-                    embedSwitched = true
-                    warn("Modelo de embeddings trocado para ${short(next)}")
+                val cands = ids.filter { Regex("embed", RegexOption.IGNORE_CASE).containsMatchIn(it) }
+                    .filterNot { Regex("-vl|rerank|clip|embedqa-1b-v2", RegexOption.IGNORE_CASE).containsMatchIn(it) }
+                    .filter { it != cfg.embed }
+                    .sortedBy { id -> preferred.indexOfFirst { id.contains(it) }.let { if (it < 0) 99 else it } }
+                for (c in cands) {
+                    try {
+                        val v = api.embed(c, texts, query)
+                        withContext(Dispatchers.Main) {
+                            applyCfg(cfg.copy(embed = c))
+                            embedSwitched = true
+                            warn("Embeddings agora: ${short(c)}")
+                        }
+                        return@withContext v
+                    } catch (e2: java.io.IOException) {
+                        tried.add(short(c))
+                        if (!isAccessErr(e2.message.orEmpty())) throw e2
+                    }
                 }
-                api.embed(next, texts, query)
+                noEmbed = true
+                throw java.io.IOException("nenhum modelo de embeddings acessível (testados: ${tried.joinToString()})")
             }
         }
+    }
+
+    private fun tokens(s: String): Set<String> =
+        s.lowercase().split(Regex("[^\\p{L}\\p{N}]+")).filter { it.length > 2 }.toSet()
+
+    private fun lexicalRank(q: String, k: Int): List<Note> {
+        val qt = tokens(q)
+        if (qt.isEmpty()) return emptyList()
+        return notes.map { n -> n to tokens(n.title + " " + n.text + " " + n.tags.joinToString(" ")).count { it in qt } }
+            .filter { it.second > 0 }
+            .sortedByDescending { it.second }
+            .take(k)
+            .map { it.first }
+    }
+
+    /** Busca semântica; se não houver embeddings acessíveis, cai para palavras-chave. */
+    private suspend fun retrieve(query: String, k: Int): List<Note> {
+        try {
+            ensureEmbeddings()
+            val qv = embedSafe(listOf(query), true)[0]
+            val r = rank(qv, k).map { it.first }
+            if (r.isNotEmpty()) return r
+        } catch (e: Exception) {
+            warn("Sem busca semântica, usando palavras-chave: ${e.message?.take(180)}")
+        }
+        return lexicalRank(query, k)
     }
 
     private suspend fun ensureEmbeddings() {
