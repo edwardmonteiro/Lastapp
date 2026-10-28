@@ -79,6 +79,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     fun detect() {
         if (!ready()) return
         noEmbed = false
+        failedChat.clear()
         viewModelScope.launch {
             try {
                 busy = "Consultando o catálogo"
@@ -140,9 +141,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                     busy = "Lendo a imagem · " + short(cfg.vision)
                     val prepared = withContext(Dispatchers.IO) { prepareImage(photo, id) }
                     imageName = prepared.first
-                    val desc = withContext(Dispatchers.IO) {
-                        api.chat(cfg.vision, visionMessages(raw, prepared.second), 4096, 0.2, noThink = true)
-                    }
+                    val desc = chatSafe("vision", visionMessages(raw, prepared.second), 4096, 0.2, true)
                     text = if (raw.isBlank()) desc else raw + "\n\n" + desc
                 } catch (e: Exception) {
                     warn("Visão falhou: ${e.message}")
@@ -154,7 +153,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             var tags: List<String> = emptyList()
             try {
                 busy = "Titulando · " + short(cfg.fast)
-                val out = withContext(Dispatchers.IO) { api.chat(cfg.fast, tagMessages(text), 2048, 0.2, noThink = true) }
+                val out = chatSafe("fast", tagMessages(text), 2048, 0.2, true)
                 val j = parseJson(out)
                 if (j != null) {
                     title = j.optString("titulo", title).ifBlank { title }.take(70)
@@ -216,7 +215,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 busy = "Recuperando notas"
                 val top = retrieve(query, 6).ifEmpty { notes.take(6).toList() }
                 busy = "Raciocinando · " + short(cfg.think)
-                val out = withContext(Dispatchers.IO) { api.chat(cfg.think, askMessages(query, top), 6000, 0.3) }
+                val out = chatSafe("think", askMessages(query, top), 6000, 0.3)
                 answer = Answer(query, out, top)
             } catch (e: Exception) {
                 message = "Pergunta falhou: ${e.message}"
@@ -250,7 +249,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 notes.take(8).forEach { if (picked.size < 8) picked.putIfAbsent(it.id, it) }
                 val list = picked.values.take(10).toList()
                 busy = "Conectando ideias · " + short(cfg.think)
-                val out = withContext(Dispatchers.IO) { api.chat(cfg.think, connectMessages(list), 6000, 0.5) }
+                val out = chatSafe("think", connectMessages(list), 6000, 0.5)
                 answer = Answer("Conexões entre suas notas recentes", out, list)
             } catch (e: Exception) {
                 message = "Conexão falhou: ${e.message}"
@@ -280,6 +279,76 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     private fun warn(s: String) {
         val cur = message
         message = if (cur == null) s else (cur + "\n" + s).lines().takeLast(3).joinToString("\n")
+    }
+
+    private val failedChat = mutableSetOf<String>()
+
+    private val chatPrefs = mapOf(
+        "think" to listOf(
+            "nemotron-3-super", "nemotron-super-49b", "llama-3.3-70b-instruct", "llama-3.1-70b-instruct",
+            "llama-3.1-nemotron-70b", "qwen3", "deepseek", "mistral-large", "nemotron-3-nano-30b",
+        ),
+        "fast" to listOf(
+            "nemotron-3-nano-30b", "nemotron-nano", "llama-3.1-8b-instruct", "llama-3.2-3b-instruct",
+            "mistral-7b-instruct", "gemma",
+        ),
+        "vision" to listOf(
+            "nemotron-3-nano-omni", "nemotron-nano-12b-v2-vl", "llama-3.2-11b-vision", "llama-3.2-90b-vision",
+            "phi-3.5-vision", "vila", "neva",
+        ),
+    )
+
+    private fun isChatAccessErr(m: String) =
+        m.startsWith("HTTP 404") || m.startsWith("HTTP 410") || m.startsWith("HTTP 403")
+
+    /** Chat com auto-recuperação: se o modelo do papel não existe para a conta, testa alternativas do catálogo. */
+    private suspend fun chatSafe(role: String, messages: JSONArray, maxTokens: Int, temp: Double, noThink: Boolean = false): String {
+        fun current() = when (role) {
+            "think" -> cfg.think
+            "fast" -> cfg.fast
+            else -> cfg.vision
+        }
+        return withContext(Dispatchers.IO) {
+            try {
+                api.chat(current(), messages, maxTokens, temp, noThink)
+            } catch (e: java.io.IOException) {
+                if (!isChatAccessErr(e.message.orEmpty())) throw e
+                failedChat.add(current())
+                val tried = mutableListOf(short(current()))
+                val prefs = chatPrefs.getValue(role)
+                val bad = Regex("embed|rerank|guard|safety|clip|parse|tts|asr|whisper|riva|fugatto|image|flux|sdxl|reward|code", RegexOption.IGNORE_CASE)
+                val ids = api.models()
+                val cands = ids.filter { id -> prefs.any { id.contains(it) } && !bad.containsMatchIn(id) }
+                    .filter { it !in failedChat }
+                    .sortedBy { id -> prefs.indexOfFirst { id.contains(it) } }
+                for (c in cands) {
+                    try {
+                        val out = api.chat(c, messages, maxTokens, temp, noThink)
+                        withContext(Dispatchers.Main) {
+                            applyCfg(
+                                when (role) {
+                                    "think" -> cfg.copy(think = c)
+                                    "fast" -> cfg.copy(fast = c)
+                                    else -> cfg.copy(vision = c)
+                                }
+                            )
+                            warn("Modelo '$role' agora: ${short(c)}")
+                        }
+                        return@withContext out
+                    } catch (e2: java.io.IOException) {
+                        tried.add(short(c))
+                        if (isChatAccessErr(e2.message.orEmpty())) failedChat.add(c) else throw e2
+                    }
+                }
+                if (role == "think" && cfg.fast != current()) {
+                    // último recurso: o modelo rápido também raciocina
+                    val out = api.chat(cfg.fast, messages, maxTokens, temp, noThink)
+                    withContext(Dispatchers.Main) { warn("Modelo 'think' indisponível; usei ${short(cfg.fast)}") }
+                    return@withContext out
+                }
+                throw java.io.IOException("nenhum modelo '$role' acessível (testados: ${tried.joinToString()})")
+            }
+        }
     }
 
     private var noEmbed = false
